@@ -8,9 +8,12 @@ from torch.utils.data import DataLoader, Dataset
 from src.sketchy_dataset import normal_transform
 
 
-class SplitInferenceDataset(Dataset):
-    def __init__(self, root, samples, max_size):
-        self.root = Path(root)
+def canonicalize_classname(name):
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+class FolderInferenceDataset(Dataset):
+    def __init__(self, samples, max_size):
         self.samples = samples
         self.max_size = max_size
         self.transform = normal_transform()
@@ -19,10 +22,10 @@ class SplitInferenceDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
-        rel_path, label = self.samples[index]
-        image_path = self.root / Path(rel_path)
+        image_path, label = self.samples[index]
+        image_path = Path(image_path)
         if not image_path.exists():
-            raise FileNotFoundError(f"Missing file referenced by split: {image_path}")
+            raise FileNotFoundError(f"Missing image file: {image_path}")
 
         with Image.open(image_path) as image_file:
             image = ImageOps.pad(
@@ -34,11 +37,11 @@ class SplitInferenceDataset(Dataset):
         return image_tensor, label
 
 
-def add_infer_args(parser, dataset_name, default_meta_root):
-    parser.add_argument("--root", type=str, required=True, help="dataset root containing image folders referenced by the split txt files")
+def add_infer_args(parser, dataset_name):
+    parser.add_argument("--root", type=str, default="", help="dataset root containing photo/ and sketch/ subfolders")
+    parser.add_argument("--photo_root", type=str, default="", help="path to the photo root directory")
+    parser.add_argument("--sketch_root", type=str, default="", help="path to the sketch root directory")
     parser.add_argument("--ckpt_path", type=str, required=True, help="path to the trained checkpoint")
-    parser.add_argument("--meta_root", type=str, default=str(default_meta_root), help="directory containing split txt files")
-    parser.add_argument("--split", type=str, default="zero", choices=["zero", "train"], help="which split txt files to use")
     parser.add_argument("--dataset", type=str, default=dataset_name, help="target dataset name")
     parser.add_argument("--backbone", type=str, default="ViT-B/32")
     parser.add_argument("--n_ctx", type=int, default=2)
@@ -67,59 +70,77 @@ def add_infer_args(parser, dataset_name, default_meta_root):
     return parser
 
 
-def load_classnames(cname_file):
-    cid_to_classname = {}
-    with Path(cname_file).open("r", encoding="utf-8") as file:
-        for line in file:
-            line = line.strip()
-            if not line:
-                continue
-            classname, cid = line.rsplit(maxsplit=1)
-            cid_to_classname[int(cid)] = classname
+def resolve_data_roots(args):
+    if args.photo_root and args.sketch_root:
+        photo_root = Path(args.photo_root)
+        sketch_root = Path(args.sketch_root)
+    elif args.root:
+        photo_root = Path(args.root) / "photo"
+        sketch_root = Path(args.root) / "sketch"
+    else:
+        raise ValueError("Provide either --root or both --photo_root and --sketch_root.")
 
-    return [cid_to_classname[idx] for idx in sorted(cid_to_classname.keys())]
+    if not photo_root.exists():
+        raise FileNotFoundError(f"Photo root does not exist: {photo_root}")
+    if not sketch_root.exists():
+        raise FileNotFoundError(f"Sketch root does not exist: {sketch_root}")
 
-
-def load_split_samples(split_file):
-    samples = []
-    with Path(split_file).open("r", encoding="utf-8") as file:
-        for line in file:
-            line = line.strip()
-            if not line:
-                continue
-            rel_path, label = line.rsplit(maxsplit=1)
-            samples.append((rel_path, int(label)))
-    return samples
+    return photo_root, sketch_root
 
 
-def filter_samples_by_classnames(split_file, cname_file, allowed_classnames=None):
-    all_classnames = load_classnames(cname_file)
-    all_samples = load_split_samples(split_file)
-
-    if allowed_classnames is None:
-        return all_samples, all_classnames
-
-    missing_classnames = sorted(set(allowed_classnames) - set(all_classnames))
-    if missing_classnames:
-        raise ValueError(f"Missing classnames in {cname_file}: {missing_classnames}")
-
-    original_cid_to_classname = {cid: classname for cid, classname in enumerate(all_classnames)}
-    classname_to_new_cid = {classname: cid for cid, classname in enumerate(allowed_classnames)}
-
-    filtered_samples = []
-    for rel_path, original_cid in all_samples:
-        classname = original_cid_to_classname[original_cid]
-        if classname in classname_to_new_cid:
-            filtered_samples.append((rel_path, classname_to_new_cid[classname]))
-
-    if not filtered_samples:
-        raise ValueError(f"No samples left after filtering {split_file}.")
-
-    return filtered_samples, list(allowed_classnames)
+def get_class_dir_map(root):
+    class_dir_map = {}
+    for path in Path(root).iterdir():
+        if path.is_dir():
+            class_dir_map[canonicalize_classname(path.name)] = path
+    return class_dir_map
 
 
-def build_dataloader(root, samples, args):
-    dataset = SplitInferenceDataset(root=root, samples=samples, max_size=args.max_size)
+def build_samples_from_directories(photo_root, sketch_root, allowed_classnames):
+    photo_dir_map = get_class_dir_map(photo_root)
+    sketch_dir_map = get_class_dir_map(sketch_root)
+
+    photo_samples = []
+    sketch_samples = []
+    missing_photo = []
+    missing_sketch = []
+    empty_classes = []
+
+    for label, classname in enumerate(allowed_classnames):
+        key = canonicalize_classname(classname)
+
+        photo_class_dir = photo_dir_map.get(key)
+        sketch_class_dir = sketch_dir_map.get(key)
+
+        if photo_class_dir is None:
+            missing_photo.append(classname)
+            continue
+        if sketch_class_dir is None:
+            missing_sketch.append(classname)
+            continue
+
+        class_photo_samples = sorted(str(path) for path in photo_class_dir.iterdir() if path.is_file())
+        class_sketch_samples = sorted(str(path) for path in sketch_class_dir.iterdir() if path.is_file())
+
+        if not class_photo_samples or not class_sketch_samples:
+            empty_classes.append(classname)
+            continue
+
+        photo_samples.extend((path, label) for path in class_photo_samples)
+        sketch_samples.extend((path, label) for path in class_sketch_samples)
+
+    if missing_photo:
+        raise FileNotFoundError(f"Missing photo class folders: {missing_photo}")
+    if missing_sketch:
+        raise FileNotFoundError(f"Missing sketch class folders: {missing_sketch}")
+    if empty_classes:
+        raise ValueError(f"These classes do not contain both photo and sketch samples: {empty_classes}")
+
+    return sketch_samples, photo_samples
+
+
+def build_dataloader(samples, args):
+    dataset = FolderInferenceDataset(samples=samples, max_size=args.max_size)
     return DataLoader(
         dataset=dataset,
         batch_size=args.test_batch_size,
@@ -201,31 +222,20 @@ def evaluate_retrieval(query_features, gallery_features, query_labels, gallery_l
     return ap.mean().item(), precision.mean().item()
 
 
-def run_inference(args, sketch_prefix, photo_prefix, p_at_k, map_at_k=0, allowed_classnames=None):
-    meta_root = Path(args.meta_root)
-    sketch_file = meta_root / f"{sketch_prefix}_{args.split}.txt"
-    photo_file = meta_root / f"{photo_prefix}_{args.split}.txt"
-    cname_file = meta_root / "cname_cid_zero.txt" if args.split == "zero" else meta_root / "cname_cid.txt"
+def run_inference(args, p_at_k, map_at_k=0, allowed_classnames=None):
+    photo_root, sketch_root = resolve_data_roots(args)
+    classnames = list(allowed_classnames) if allowed_classnames is not None else []
+    if not classnames:
+        raise ValueError("allowed_classnames must be provided for across-dataset inference.")
 
-    for required_path in [meta_root, sketch_file, photo_file, cname_file]:
-        if not required_path.exists():
-            raise FileNotFoundError(f"Missing inference metadata file: {required_path}")
-
-    sketch_samples, classnames = filter_samples_by_classnames(
-        split_file=sketch_file,
-        cname_file=cname_file,
-        allowed_classnames=allowed_classnames,
+    sketch_samples, photo_samples = build_samples_from_directories(
+        photo_root=photo_root,
+        sketch_root=sketch_root,
+        allowed_classnames=classnames,
     )
-    photo_samples, photo_classnames = filter_samples_by_classnames(
-        split_file=photo_file,
-        cname_file=cname_file,
-        allowed_classnames=allowed_classnames,
-    )
-    if classnames != photo_classnames:
-        raise ValueError("Sketch and photo class orders do not match after filtering.")
 
-    sketch_loader = build_dataloader(args.root, sketch_samples, args)
-    photo_loader = build_dataloader(args.root, photo_samples, args)
+    sketch_loader = build_dataloader(sketch_samples, args)
+    photo_loader = build_dataloader(photo_samples, args)
 
     model, device = load_model_from_checkpoint(args, classnames)
     sketch_features, sketch_labels = extract_features(model, sketch_loader, classnames, image_type="sketch", device=device)
@@ -240,17 +250,13 @@ def run_inference(args, sketch_prefix, photo_prefix, p_at_k, map_at_k=0, allowed
         map_at_k=map_at_k,
     )
 
+    print(f"Dataset: {args.dataset}")
+    print(f"Classes: {len(classnames)}")
+    print(f"Sketch root: {sketch_root}")
+    print(f"Photo root: {photo_root}")
+    print(f"Queries: {len(sketch_features)} | Gallery: {len(photo_features)}")
     if map_at_k > 0:
-        print(f"Dataset: {args.dataset}")
-        print(f"Split: {args.split}")
-        print(f"Classes: {len(classnames)}")
-        print(f"Queries: {len(sketch_features)} | Gallery: {len(photo_features)}")
         print(f"mAP@{map_at_k}: {mAP:.6f}")
-        print(f"P@{p_at_k}: {precision:.6f}")
     else:
-        print(f"Dataset: {args.dataset}")
-        print(f"Split: {args.split}")
-        print(f"Classes: {len(classnames)}")
-        print(f"Queries: {len(sketch_features)} | Gallery: {len(photo_features)}")
         print(f"mAP@all: {mAP:.6f}")
-        print(f"P@{p_at_k}: {precision:.6f}")
+    print(f"P@{p_at_k}: {precision:.6f}")

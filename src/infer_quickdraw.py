@@ -12,18 +12,12 @@ from src.infer_utils import add_infer_args, run_inference
 
 def main():
     parser = argparse.ArgumentParser(description="Across-dataset inference on QuickDraw from a checkpoint path")
-    add_infer_args(
-        parser=parser,
-        dataset_name="quickdraw",
-        default_meta_root=PROJECT_ROOT / "datasets" / "QuickDraw",
-    )
+    add_infer_args(parser=parser, dataset_name="quickdraw")
     args = parser.parse_args()
 
     print(f"Using across-dataset class subset from seed {ACROSS_DATASET_SEED}.")
     run_inference(
         args,
-        sketch_prefix="sketch",
-        photo_prefix="all_photo",
         p_at_k=100,
         allowed_classnames=ACROSS_UNSEEN_CLASSES["quickdraw"],
     )

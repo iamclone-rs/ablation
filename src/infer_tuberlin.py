@@ -12,18 +12,12 @@ from src.infer_utils import add_infer_args, run_inference
 
 def main():
     parser = argparse.ArgumentParser(description="Across-dataset inference on TU-Berlin from a checkpoint path")
-    add_infer_args(
-        parser=parser,
-        dataset_name="tuberlin",
-        default_meta_root=PROJECT_ROOT / "datasets" / "TUBerlin",
-    )
+    add_infer_args(parser=parser, dataset_name="tuberlin")
     args = parser.parse_args()
 
     print(f"Using across-dataset class subset from seed {ACROSS_DATASET_SEED}.")
     run_inference(
         args,
-        sketch_prefix="png",
-        photo_prefix="ImageResized",
         p_at_k=100,
         allowed_classnames=ACROSS_UNSEEN_CLASSES["tuberlin"],
     )
