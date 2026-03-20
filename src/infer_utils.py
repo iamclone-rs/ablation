@@ -12,6 +12,10 @@ def canonicalize_classname(name):
     return "".join(ch for ch in name.lower() if ch.isalnum())
 
 
+def sanitize_path_string(path_string):
+    return (path_string or "").strip().strip('"').strip("'")
+
+
 class FolderInferenceDataset(Dataset):
     def __init__(self, samples, max_size):
         self.samples = samples
@@ -37,12 +41,12 @@ class FolderInferenceDataset(Dataset):
         return image_tensor, label
 
 
-def add_infer_args(parser, dataset_name):
+def add_infer_args(parser, dataset_name, dataset_choices=None):
     parser.add_argument("--root", type=str, default="", help="dataset root containing photo/ and sketch/ subfolders")
     parser.add_argument("--photo_root", type=str, default="", help="path to the photo root directory")
     parser.add_argument("--sketch_root", type=str, default="", help="path to the sketch root directory")
     parser.add_argument("--ckpt_path", type=str, required=True, help="path to the trained checkpoint")
-    parser.add_argument("--dataset", type=str, default=dataset_name, help="target dataset name")
+    parser.add_argument("--dataset", type=str, default=dataset_name, choices=dataset_choices, help="target dataset name")
     parser.add_argument("--backbone", type=str, default="ViT-B/32")
     parser.add_argument("--n_ctx", type=int, default=2)
     parser.add_argument("--img_ctx", type=int, default=2)
@@ -70,20 +74,66 @@ def add_infer_args(parser, dataset_name):
     return parser
 
 
+def find_kaggle_suffix_match(path):
+    kaggle_root = Path("/kaggle/input")
+    if not str(path).startswith("/kaggle/input") or not kaggle_root.exists():
+        return None
+
+    tail_options = []
+    parts = path.parts
+    for length in [4, 3, 2]:
+        if len(parts) >= length:
+            tail_options.append(parts[-length:])
+
+    matches = []
+    for candidate in kaggle_root.rglob(path.name):
+        if not candidate.exists():
+            continue
+        candidate_parts = candidate.parts
+        if any(len(candidate_parts) >= len(tail) and candidate_parts[-len(tail):] == tail for tail in tail_options):
+            matches.append(candidate)
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if len(matches) > 1:
+        matches = sorted(matches, key=lambda item: len(item.parts))
+        return matches[0]
+
+    return None
+
+
+def resolve_existing_path(path_string, label):
+    sanitized = sanitize_path_string(path_string)
+    path = Path(sanitized)
+    if path.exists():
+        return path
+
+    kaggle_match = find_kaggle_suffix_match(path)
+    if kaggle_match is not None:
+        print(f"{label} not found exactly, using Kaggle match: {kaggle_match}")
+        return kaggle_match
+
+    raise FileNotFoundError(f"{label} does not exist: {sanitized!r}")
+
+
 def resolve_data_roots(args):
     if args.photo_root and args.sketch_root:
-        photo_root = Path(args.photo_root)
-        sketch_root = Path(args.sketch_root)
+        photo_root = resolve_existing_path(args.photo_root, "Photo root")
+        sketch_root = resolve_existing_path(args.sketch_root, "Sketch root")
     elif args.root:
-        photo_root = Path(args.root) / "photo"
-        sketch_root = Path(args.root) / "sketch"
+        root = Path(sanitize_path_string(args.root))
+        if root.name.lower() == "photo" and root.exists():
+            photo_root = root
+            sketch_root = resolve_existing_path(str(root.parent / "sketch"), "Sketch root")
+        elif root.name.lower() == "sketch" and root.exists():
+            sketch_root = root
+            photo_root = resolve_existing_path(str(root.parent / "photo"), "Photo root")
+        else:
+            photo_root = resolve_existing_path(str(root / "photo"), "Photo root")
+            sketch_root = resolve_existing_path(str(root / "sketch"), "Sketch root")
     else:
         raise ValueError("Provide either --root or both --photo_root and --sketch_root.")
-
-    if not photo_root.exists():
-        raise FileNotFoundError(f"Photo root does not exist: {photo_root}")
-    if not sketch_root.exists():
-        raise FileNotFoundError(f"Sketch root does not exist: {sketch_root}")
 
     return photo_root, sketch_root
 
@@ -92,51 +142,76 @@ def get_class_dir_map(root):
     class_dir_map = {}
     for path in Path(root).iterdir():
         if path.is_dir():
-            class_dir_map[canonicalize_classname(path.name)] = path
+            class_dir_map[canonicalize_classname(path.name)] = (path.name, path)
     return class_dir_map
 
 
-def build_samples_from_directories(photo_root, sketch_root, allowed_classnames):
+def list_common_classnames(photo_root, sketch_root):
     photo_dir_map = get_class_dir_map(photo_root)
     sketch_dir_map = get_class_dir_map(sketch_root)
+    common_keys = sorted(set(photo_dir_map.keys()) & set(sketch_dir_map.keys()))
+    return [photo_dir_map[key][0] for key in common_keys]
 
-    photo_samples = []
-    sketch_samples = []
-    missing_photo = []
-    missing_sketch = []
-    empty_classes = []
 
-    for label, classname in enumerate(allowed_classnames):
-        key = canonicalize_classname(classname)
+def resolve_requested_classnames(requested_classnames, available_classnames):
+    available_map = {canonicalize_classname(classname): classname for classname in available_classnames}
+    resolved = []
+    missing = []
 
-        photo_class_dir = photo_dir_map.get(key)
-        sketch_class_dir = sketch_dir_map.get(key)
+    for classname in requested_classnames:
+        resolved_name = available_map.get(canonicalize_classname(classname))
+        if resolved_name is None:
+            missing.append(classname)
+        else:
+            resolved.append(resolved_name)
 
-        if photo_class_dir is None:
-            missing_photo.append(classname)
-            continue
-        if sketch_class_dir is None:
-            missing_sketch.append(classname)
-            continue
+    if missing:
+        raise FileNotFoundError(f"Missing classes in folder structure: {missing}")
 
-        class_photo_samples = sorted(str(path) for path in photo_class_dir.iterdir() if path.is_file())
-        class_sketch_samples = sorted(str(path) for path in sketch_class_dir.iterdir() if path.is_file())
+    return resolved
 
-        if not class_photo_samples or not class_sketch_samples:
-            empty_classes.append(classname)
-            continue
 
-        photo_samples.extend((path, label) for path in class_photo_samples)
-        sketch_samples.extend((path, label) for path in class_sketch_samples)
+def build_samples_from_directories(photo_root, sketch_root, label_classnames, sketch_classnames=None, photo_classnames=None):
+    photo_dir_map = get_class_dir_map(photo_root)
+    sketch_dir_map = get_class_dir_map(sketch_root)
+    available_classnames = list_common_classnames(photo_root, sketch_root)
 
-    if missing_photo:
-        raise FileNotFoundError(f"Missing photo class folders: {missing_photo}")
-    if missing_sketch:
-        raise FileNotFoundError(f"Missing sketch class folders: {missing_sketch}")
-    if empty_classes:
-        raise ValueError(f"These classes do not contain both photo and sketch samples: {empty_classes}")
+    resolved_label_classnames = resolve_requested_classnames(label_classnames, available_classnames)
+    resolved_sketch_classnames = resolve_requested_classnames(
+        sketch_classnames or resolved_label_classnames,
+        available_classnames,
+    )
+    resolved_photo_classnames = resolve_requested_classnames(
+        photo_classnames or resolved_label_classnames,
+        available_classnames,
+    )
 
-    return sketch_samples, photo_samples
+    label_map = {
+        canonicalize_classname(classname): label
+        for label, classname in enumerate(resolved_label_classnames)
+    }
+
+    def collect_samples(requested_classnames, dir_map):
+        samples = []
+        empty_classes = []
+        for classname in requested_classnames:
+            key = canonicalize_classname(classname)
+            _, class_dir = dir_map[key]
+            class_samples = sorted(str(path) for path in class_dir.iterdir() if path.is_file())
+            if not class_samples:
+                empty_classes.append(classname)
+                continue
+            label = label_map[key]
+            samples.extend((path, label) for path in class_samples)
+
+        if empty_classes:
+            raise ValueError(f"These classes do not contain samples: {empty_classes}")
+
+        return samples
+
+    sketch_samples = collect_samples(resolved_sketch_classnames, sketch_dir_map)
+    photo_samples = collect_samples(resolved_photo_classnames, photo_dir_map)
+    return sketch_samples, photo_samples, resolved_label_classnames
 
 
 def build_dataloader(samples, args):
@@ -222,16 +297,30 @@ def evaluate_retrieval(query_features, gallery_features, query_labels, gallery_l
     return ap.mean().item(), precision.mean().item()
 
 
+def print_metrics(args, classnames, sketch_root, photo_root, query_count, gallery_count, p_at_k, mAP, precision, map_at_k=0, query_class_count=None):
+    print(f"Dataset: {args.dataset}")
+    print(f"Classes: {len(classnames)}")
+    if query_class_count is not None:
+        print(f"Query classes: {query_class_count}")
+    print(f"Sketch root: {sketch_root}")
+    print(f"Photo root: {photo_root}")
+    print(f"Queries: {query_count} | Gallery: {gallery_count}")
+    if map_at_k > 0:
+        print(f"mAP@{map_at_k}: {mAP:.6f}")
+    else:
+        print(f"mAP@all: {mAP:.6f}")
+    print(f"P@{p_at_k}: {precision:.6f}")
+
+
 def run_inference(args, p_at_k, map_at_k=0, allowed_classnames=None):
     photo_root, sketch_root = resolve_data_roots(args)
-    classnames = list(allowed_classnames) if allowed_classnames is not None else []
-    if not classnames:
+    if not allowed_classnames:
         raise ValueError("allowed_classnames must be provided for across-dataset inference.")
 
-    sketch_samples, photo_samples = build_samples_from_directories(
+    sketch_samples, photo_samples, classnames = build_samples_from_directories(
         photo_root=photo_root,
         sketch_root=sketch_root,
-        allowed_classnames=classnames,
+        label_classnames=allowed_classnames,
     )
 
     sketch_loader = build_dataloader(sketch_samples, args)
@@ -250,13 +339,59 @@ def run_inference(args, p_at_k, map_at_k=0, allowed_classnames=None):
         map_at_k=map_at_k,
     )
 
-    print(f"Dataset: {args.dataset}")
-    print(f"Classes: {len(classnames)}")
-    print(f"Sketch root: {sketch_root}")
-    print(f"Photo root: {photo_root}")
-    print(f"Queries: {len(sketch_features)} | Gallery: {len(photo_features)}")
-    if map_at_k > 0:
-        print(f"mAP@{map_at_k}: {mAP:.6f}")
-    else:
-        print(f"mAP@all: {mAP:.6f}")
-    print(f"P@{p_at_k}: {precision:.6f}")
+    print_metrics(
+        args=args,
+        classnames=classnames,
+        sketch_root=sketch_root,
+        photo_root=photo_root,
+        query_count=len(sketch_features),
+        gallery_count=len(photo_features),
+        p_at_k=p_at_k,
+        mAP=mAP,
+        precision=precision,
+        map_at_k=map_at_k,
+    )
+
+
+def run_gzs_inference(args, unseen_classnames, p_at_k, map_at_k=0):
+    photo_root, sketch_root = resolve_data_roots(args)
+    all_classnames = list_common_classnames(photo_root, sketch_root)
+    query_classnames = resolve_requested_classnames(unseen_classnames, all_classnames)
+
+    sketch_samples, photo_samples, classnames = build_samples_from_directories(
+        photo_root=photo_root,
+        sketch_root=sketch_root,
+        label_classnames=all_classnames,
+        sketch_classnames=query_classnames,
+        photo_classnames=all_classnames,
+    )
+
+    sketch_loader = build_dataloader(sketch_samples, args)
+    photo_loader = build_dataloader(photo_samples, args)
+
+    model, device = load_model_from_checkpoint(args, classnames)
+    sketch_features, sketch_labels = extract_features(model, sketch_loader, classnames, image_type="sketch", device=device)
+    photo_features, photo_labels = extract_features(model, photo_loader, classnames, image_type="photo", device=device)
+
+    mAP, precision = evaluate_retrieval(
+        query_features=sketch_features,
+        gallery_features=photo_features,
+        query_labels=sketch_labels,
+        gallery_labels=photo_labels,
+        p_at_k=p_at_k,
+        map_at_k=map_at_k,
+    )
+
+    print_metrics(
+        args=args,
+        classnames=classnames,
+        sketch_root=sketch_root,
+        photo_root=photo_root,
+        query_count=len(sketch_features),
+        gallery_count=len(photo_features),
+        p_at_k=p_at_k,
+        mAP=mAP,
+        precision=precision,
+        map_at_k=map_at_k,
+        query_class_count=len(query_classnames),
+    )
