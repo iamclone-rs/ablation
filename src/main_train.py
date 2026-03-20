@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import numpy as np
 import random
@@ -7,6 +8,10 @@ from torch.utils.data import DataLoader, Subset
 from pytorch_lightning import Trainer 
 from pytorch_lightning.loggers import TensorBoardLogger 
 from pytorch_lightning.callbacks import ModelCheckpoint 
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from src.sketchy_dataset import TrainDataset, ValidDataset
 from src.model import ZS_SBIR
@@ -61,6 +66,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_co_ph', type=bool, default=True)
     parser.add_argument('--progress', type=bool, default=False)
     parser.add_argument('--use_subset', type=bool, default=False)
+    parser.add_argument('--save_every_n_epochs', type=int, default=1)
     
     parser.add_argument('--exp_name', type=str, default='Co_prompt')
     
@@ -68,11 +74,10 @@ if __name__ == "__main__":
     logger = TensorBoardLogger('tb_logs', name=args.exp_name)
     
     checkpoint_callback = ModelCheckpoint(
-        monitor='mAP',
         dirpath='saved_models/%s'%args.exp_name,
-        filename="{epoch:02d}-{mAP:.4f}",
-        save_top_k=1,
-        mode='max',
+        filename="epoch{epoch:02d}",
+        every_n_epochs=args.save_every_n_epochs,
+        save_top_k=-1,
         save_last=True)
     
     ckpt_path = args.ckpt_path
